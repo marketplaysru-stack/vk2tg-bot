@@ -26,18 +26,10 @@ if not MAIN_TOKEN:
     sys.exit(1)
 logger.info("✅ Токен загружен из переменной окружения TG_MAIN_TOKEN")
 
-# ===== СОЗДАНИЕ ПАПКИ /data (если её нет) =====
-DATA_DIR = "/data"
-try:
-    os.makedirs(DATA_DIR, exist_ok=True)
-    logger.info(f"📁 Папка {DATA_DIR} создана (или уже существует)")
-except Exception as e:
-    logger.error(f"❌ Не удалось создать папку {DATA_DIR}: {e}")
-    # Если не получилось, попробуем использовать текущую директорию
-    DATA_DIR = "."
-    logger.warning(f"⚠️ Используем текущую директорию: {DATA_DIR}")
-
-DB_PATH = os.path.join(DATA_DIR, "vk2tg.db")
+# ===== ПУТЬ К БАЗЕ ДАННЫХ (в папке со скриптом) =====
+# Это надёжнее, чем /data, так как у нас точно есть права на запись в текущей папке
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "vk2tg.db")
 logger.info(f"📂 База данных будет храниться по пути: {DB_PATH}")
 
 # ===== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ =====
