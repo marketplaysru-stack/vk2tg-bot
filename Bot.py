@@ -38,7 +38,7 @@ logger.info(f"📂 Файл конфигурации: {CONFIG_FILE}")
 # ===== КОНСТАНТЫ =====
 MAX_POSTS_PER_DAY = 4
 MAX_CONFIGS_PER_USER = 10
-SEND_DELAY = 60  # пауза между отправками в секундах (увеличена)
+SEND_DELAY = 30  # секунд между отправками
 MAX_MESSAGE_LENGTH = 4000
 
 # ===== ЗАГРУЗКА / СОХРАНЕНИЕ КОНФИГУРАЦИИ =====
@@ -50,9 +50,14 @@ def load_config():
         return {}
 
 def save_config(config):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-    logger.info("💾 Конфигурация сохранена")
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        logger.info("💾 Конфигурация сохранена")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения конфига: {e}")
+        return False
 
 # ===== РАБОТА С КОНФИГУРАЦИЯМИ =====
 def get_user_configs(user_id):
@@ -177,23 +182,34 @@ def get_last_posts(group_id, token, count=5):
         return response["items"]
     return []
 
-# ===== ФУНКЦИЯ ДЛЯ ФОРМАТИРОВАНИЯ ПОСТА ПОД TELEGRAM =====
+# ===== ФУНКЦИЯ ДЛЯ ФОРМАТИРОВАНИЯ ПОСТА ПОД TELEGRAM (улучшенная) =====
 def format_post_for_telegram(text, post_link):
+    """
+    Адаптирует текст поста для Telegram:
+    - удаляет ссылки на изображения (они не нужны)
+    - удаляет эмодзи-иконки в начале (чтобы не было дублирования)
+    - разбивает на абзацы
+    - добавляет ссылку на пост в конце
+    """
     if not text:
         text = "Новый пост без текста"
-    lines = text.split('\n')
-    cleaned_lines = []
-    for line in lines:
-        line = line.strip()
-        if line:
-            cleaned_lines.append(line)
-    formatted = '\n\n'.join(cleaned_lines)
+    # Удаляем ссылки на изображения (обычно в формате [url] или (url))
+    text = re.sub(r'\[.*?\]\(.*?\)', '', text)
+    text = re.sub(r'\(https?://[^\)]+\)', '', text)
+    # Удаляем эмодзи-иконки в начале строк (если они есть)
+    text = re.sub(r'^[😀-🙏🌀-🗿]+\s*', '', text, flags=re.MULTILINE)
+    # Разбиваем на строки, убираем пустые
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    # Склеиваем с двойным переносом для разделения абзацев
+    formatted = '\n\n'.join(lines)
+    # Обрезаем до лимита
     if len(formatted) > MAX_MESSAGE_LENGTH - 100:
         formatted = formatted[:MAX_MESSAGE_LENGTH - 100] + "..."
+    # Добавляем ссылку на пост
     result = f"{formatted}\n\n➡️ {post_link}"
     return result
 
-# ===== ФУНКЦИИ ДЛЯ ОТПРАВКИ В TELEGRAM (с защитой от флуда) =====
+# ===== ФУНКЦИИ ДЛЯ ОТПРАВКИ В TELEGRAM =====
 async def send_to_telegram(tg_token, chat_id, text, attachments=None):
     bot = None
     try:
@@ -215,7 +231,6 @@ async def send_to_telegram(tg_token, chat_id, text, attachments=None):
                         return True
                 except Exception as e:
                     logger.error(f"Error sending photo: {e}")
-        # Отправляем текст
         if len(text) > MAX_MESSAGE_LENGTH:
             for i in range(0, len(text), MAX_MESSAGE_LENGTH):
                 chunk = text[i:i+MAX_MESSAGE_LENGTH]
@@ -228,7 +243,6 @@ async def send_to_telegram(tg_token, chat_id, text, attachments=None):
         wait_time = e.retry_after
         logger.warning(f"⏳ Флуд-контроль: нужно подождать {wait_time} секунд")
         await asyncio.sleep(wait_time + 5)
-        # Повторяем попытку (рекурсивно, но не бесконечно)
         return await send_to_telegram(tg_token, chat_id, text, attachments)
     except Exception as e:
         logger.error(f"Error sending to Telegram: {e}")
