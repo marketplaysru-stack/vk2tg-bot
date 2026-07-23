@@ -19,36 +19,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===== ЗАГРУЗКА ТОКЕНА ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ =====
-# Используем переменную TG_MAIN_TOKEN (новое имя)
+# ===== ЗАГРУЗКА ТОКЕНА =====
 MAIN_TOKEN = os.getenv("TG_MAIN_TOKEN")
 if not MAIN_TOKEN:
     logger.error("❌ TG_MAIN_TOKEN не задан в переменных окружения! Бот не запустится.")
     sys.exit(1)
 logger.info("✅ Токен загружен из переменной окружения TG_MAIN_TOKEN")
 
-# Путь к базе данных (хранилище настроек)
-DB_PATH = os.path.join("/data", "vk2tg.db")
+# ===== СОЗДАНИЕ ПАПКИ /data (если её нет) =====
+DATA_DIR = "/data"
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    logger.info(f"📁 Папка {DATA_DIR} создана (или уже существует)")
+except Exception as e:
+    logger.error(f"❌ Не удалось создать папку {DATA_DIR}: {e}")
+    # Если не получилось, попробуем использовать текущую директорию
+    DATA_DIR = "."
+    logger.warning(f"⚠️ Используем текущую директорию: {DATA_DIR}")
 
-# Инициализация базы данных
+DB_PATH = os.path.join(DATA_DIR, "vk2tg.db")
+logger.info(f"📂 База данных будет храниться по пути: {DB_PATH}")
+
+# ===== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ =====
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        vk_token TEXT,
-        vk_group_id INTEGER,
-        tg_token TEXT,
-        tg_chat_id TEXT,
-        last_post_id INTEGER DEFAULT 0,
-        enabled INTEGER DEFAULT 1
-    )''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            vk_token TEXT,
+            vk_group_id INTEGER,
+            tg_token TEXT,
+            tg_chat_id TEXT,
+            last_post_id INTEGER DEFAULT 0,
+            enabled INTEGER DEFAULT 1
+        )''')
+        conn.commit()
+        conn.close()
+        logger.info("✅ База данных инициализирована")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации базы данных: {e}")
+        sys.exit(1)
 
 init_db()
 
-# Функции работы с БД
+# ===== ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ =====
 def get_user_configs(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
