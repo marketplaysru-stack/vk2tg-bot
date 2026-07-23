@@ -5,10 +5,10 @@ import sys
 import json
 import time
 import requests
+import re
 from datetime import datetime, timedelta
-from collections import defaultdict
 
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ===== НАСТРОЙКА ЛОГИРОВАНИЯ =====
@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 # ===== ЗАГРУЗКА ТОКЕНА =====
 MAIN_TOKEN = os.getenv("TG_MAIN_TOKEN")
 if not MAIN_TOKEN:
-    logger.error("❌ TG_MAIN_TOKEN не задан в переменных окружения! Бот не запустится.")
+    logger.error("❌ TG_MAIN_TOKEN не задан в переменных окружения!")
     sys.exit(1)
-logger.info("✅ Токен загружен из переменной окружения TG_MAIN_TOKEN")
+logger.info("✅ Токен загружен")
 
 # ===== ПУТЬ К ФАЙЛУ КОНФИГУРАЦИИ =====
 DATA_DIR = "/data"
@@ -38,6 +38,7 @@ logger.info(f"📂 Файл конфигурации: {CONFIG_FILE}")
 MAX_POSTS_PER_DAY = 4
 MAX_CONFIGS_PER_USER = 10
 SEND_DELAY = 10  # пауза между отправками в секундах
+MAX_MESSAGE_LENGTH = 4000  # лимит Telegram
 
 # ===== ЗАГРУЗКА / СОХРАНЕНИЕ КОНФИГУРАЦИИ =====
 def load_config():
@@ -61,7 +62,6 @@ def add_user_config(user_id, vk_token, vk_group_id, tg_token, tg_chat_id):
     key = str(user_id)
     if key not in config:
         config[key] = []
-    # Проверяем, нет ли уже такой группы
     for entry in config[key]:
         if entry["vk_group_id"] == vk_group_id:
             return False
@@ -72,7 +72,7 @@ def add_user_config(user_id, vk_token, vk_group_id, tg_token, tg_chat_id):
         "tg_chat_id": tg_chat_id,
         "last_post_id": 0,
         "enabled": True,
-        "daily_posts": []  # список {post_id, date}
+        "daily_posts": []
     })
     save_config(config)
     return True
@@ -117,9 +117,7 @@ def mark_post_sent(user_id, vk_group_id, post_id):
     if key in config:
         for entry in config[key]:
             if entry["vk_group_id"] == vk_group_id:
-                # Удаляем записи старше сегодня
                 entry["daily_posts"] = [p for p in entry["daily_posts"] if p.get("date") == today]
-                # Добавляем текущий
                 entry["daily_posts"].append({"post_id": post_id, "date": today})
                 save_config(config)
                 return True
@@ -136,7 +134,6 @@ def get_today_post_count(user_id, vk_group_id):
     return 0
 
 def clear_old_daily_posts():
-    """Удаляет записи старше 7 дней."""
     config = load_config()
     week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     changed = False
@@ -176,12 +173,39 @@ def get_last_posts(group_id, token, count=5):
         return response["items"]
     return []
 
+# ===== ФУНКЦИЯ ДЛЯ ФОРМАТИРОВАНИЯ ПОСТА ПОД TELEGRAM =====
+def format_post_for_telegram(text, post_link):
+    """
+    Адаптирует текст поста для Telegram:
+    - разбивает на абзацы
+    - добавляет разделители
+    - убирает лишние переносы
+    - ссылка на пост в конце с подписью
+    """
+    if not text:
+        text = "Новый пост без текста"
+    # Очищаем текст от лишних переносов
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        line = line.strip()
+        if line:
+            cleaned_lines.append(line)
+    # Склеиваем с двойным переносом для разделения абзацев
+    formatted = '\n\n'.join(cleaned_lines)
+    # Обрезаем до лимита
+    if len(formatted) > MAX_MESSAGE_LENGTH - 100:
+        formatted = formatted[:MAX_MESSAGE_LENGTH - 100] + "..."
+    # Добавляем ссылку на пост в конце
+    result = f"{formatted}\n\n➡️ {post_link}"
+    return result
+
 # ===== ФУНКЦИИ ДЛЯ ОТПРАВКИ В TELEGRAM =====
 async def send_to_telegram(tg_token, chat_id, text, attachments=None):
     bot = None
     try:
-        from telegram import Bot
         bot = Bot(token=tg_token)
+        # Сначала пробуем отправить с фото (если есть)
         if attachments:
             photo_url = None
             for att in attachments:
@@ -195,11 +219,21 @@ async def send_to_telegram(tg_token, chat_id, text, attachments=None):
                 try:
                     resp = requests.get(photo_url, timeout=30)
                     if resp.status_code == 200:
+                        # Отправляем фото с подписью (текст)
                         await bot.send_photo(chat_id=chat_id, photo=resp.content, caption=text[:1024])
                         return True
                 except Exception as e:
                     logger.error(f"Error sending photo: {e}")
-        await bot.send_message(chat_id=chat_id, text=text[:4096])
+        # Если фото не отправилось или его нет, шлём текст
+        # Разбиваем длинные сообщения, если нужно
+        if len(text) > MAX_MESSAGE_LENGTH:
+            # Отправляем частями
+            for i in range(0, len(text), MAX_MESSAGE_LENGTH):
+                chunk = text[i:i+MAX_MESSAGE_LENGTH]
+                await bot.send_message(chat_id=chat_id, text=chunk)
+                await asyncio.sleep(2)
+        else:
+            await bot.send_message(chat_id=chat_id, text=text)
         return True
     except Exception as e:
         logger.error(f"Error sending to Telegram: {e}")
@@ -231,19 +265,24 @@ async def check_new_posts(context: ContextTypes.DEFAULT_TYPE):
             if not posts:
                 continue
 
-            new_posts = [p for p in posts if p["id"] > last_post_id]
+            # Проверяем, не отправляли ли уже эти посты сегодня
+            already_sent = [p["post_id"] for p in entry["daily_posts"] if p.get("date") == datetime.now().strftime("%Y-%m-%d")]
+
+            new_posts = []
+            for post in posts:
+                if post["id"] > last_post_id and post["id"] not in already_sent:
+                    new_posts.append(post)
             new_posts.sort(key=lambda x: x["id"])
 
             for post in new_posts:
                 if today_count >= MAX_POSTS_PER_DAY:
                     break
+
                 text = post.get("text", "")
-                if not text:
-                    text = "Новый пост без текста"
                 link = f"https://vk.com/wall{vk_group_id}_{post['id']}"
-                full_text = f"{text}\n\n➡️ {link}"
+                formatted_text = format_post_for_telegram(text, link)
                 attachments = post.get("attachments", [])
-                success = await send_to_telegram(tg_token, tg_chat_id, full_text, attachments)
+                success = await send_to_telegram(tg_token, tg_chat_id, formatted_text, attachments)
                 if success:
                     update_last_post_id(user_id, vk_group_id, post["id"])
                     mark_post_sent(user_id, vk_group_id, post["id"])
@@ -251,7 +290,7 @@ async def check_new_posts(context: ContextTypes.DEFAULT_TYPE):
                     logger.info(f"✅ Отправлен пост {post['id']} для группы {vk_group_id} (сегодня {today_count})")
                 else:
                     logger.error(f"❌ Не удалось отправить пост {post['id']}")
-                await asyncio.sleep(SEND_DELAY)  # пауза
+                await asyncio.sleep(SEND_DELAY)
 
 # ===== ОБРАБОТЧИКИ КОМАНД =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -316,7 +355,6 @@ async def handle_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ VK_TOKEN должен начинаться с 'vk1.a.'")
         context.user_data["awaiting_add"] = False
         return
-    # Проверяем дубли
     for entry in configs:
         if entry["vk_group_id"] == vk_group_id:
             await update.message.reply_text(f"❌ Связка для группы {vk_group_id} уже существует.")
