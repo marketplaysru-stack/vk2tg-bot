@@ -2,17 +2,16 @@ import asyncio
 import logging
 import os
 import sys
-import sqlite3
-import time
 import json
+import time
 import requests
-import re
 from datetime import datetime, timedelta
+from collections import defaultdict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# Настройка логирования
+# ===== НАСТРОЙКА ЛОГИРОВАНИЯ =====
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -26,75 +25,129 @@ if not MAIN_TOKEN:
     sys.exit(1)
 logger.info("✅ Токен загружен из переменной окружения TG_MAIN_TOKEN")
 
-# ===== ПУТЬ К БАЗЕ ДАННЫХ (в папке со скриптом) =====
-# Это надёжнее, чем /data, так как у нас точно есть права на запись в текущей папке
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "vk2tg.db")
-logger.info(f"📂 База данных будет храниться по пути: {DB_PATH}")
+# ===== ПУТЬ К ФАЙЛУ КОНФИГУРАЦИИ =====
+DATA_DIR = "/data"
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR = "."
+CONFIG_FILE = os.path.join(DATA_DIR, "vk2tg_config.json")
+logger.info(f"📂 Файл конфигурации: {CONFIG_FILE}")
 
-# ===== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ =====
-def init_db():
+# ===== КОНСТАНТЫ =====
+MAX_POSTS_PER_DAY = 4
+MAX_CONFIGS_PER_USER = 10
+SEND_DELAY = 10  # пауза между отправками в секундах
+
+# ===== ЗАГРУЗКА / СОХРАНЕНИЕ КОНФИГУРАЦИИ =====
+def load_config():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            vk_token TEXT,
-            vk_group_id INTEGER,
-            tg_token TEXT,
-            tg_chat_id TEXT,
-            last_post_id INTEGER DEFAULT 0,
-            enabled INTEGER DEFAULT 1
-        )''')
-        conn.commit()
-        conn.close()
-        logger.info("✅ База данных инициализирована")
-    except Exception as e:
-        logger.error(f"❌ Ошибка инициализации базы данных: {e}")
-        sys.exit(1)
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
-init_db()
+def save_config(config):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
 
-# ===== ФУНКЦИИ РАБОТЫ С БАЗОЙ ДАННЫХ =====
+# ===== РАБОТА С КОНФИГУРАЦИЯМИ =====
 def get_user_configs(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT vk_token, vk_group_id, tg_token, tg_chat_id, last_post_id, enabled FROM users WHERE user_id = ?", (user_id,))
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    config = load_config()
+    return config.get(str(user_id), [])
 
 def add_user_config(user_id, vk_token, vk_group_id, tg_token, tg_chat_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO users (user_id, vk_token, vk_group_id, tg_token, tg_chat_id, last_post_id, enabled) VALUES (?, ?, ?, ?, ?, 0, 1)",
-              (user_id, vk_token, vk_group_id, tg_token, tg_chat_id))
-    conn.commit()
-    conn.close()
+    config = load_config()
+    key = str(user_id)
+    if key not in config:
+        config[key] = []
+    # Проверяем, нет ли уже такой группы
+    for entry in config[key]:
+        if entry["vk_group_id"] == vk_group_id:
+            return False
+    config[key].append({
+        "vk_token": vk_token,
+        "vk_group_id": vk_group_id,
+        "tg_token": tg_token,
+        "tg_chat_id": tg_chat_id,
+        "last_post_id": 0,
+        "enabled": True,
+        "daily_posts": []  # список {post_id, date}
+    })
+    save_config(config)
+    return True
 
-def delete_user_config(user_id, index):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE rowid = (SELECT rowid FROM users WHERE user_id = ? LIMIT 1 OFFSET ?)", (user_id, index))
-    conn.commit()
-    conn.close()
+def delete_user_config(user_id, vk_group_id):
+    config = load_config()
+    key = str(user_id)
+    if key in config:
+        config[key] = [e for e in config[key] if e["vk_group_id"] != vk_group_id]
+        if not config[key]:
+            del config[key]
+        save_config(config)
+        return True
+    return False
 
-def update_last_post_id(user_id, vk_group_id, last_post_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET last_post_id = ? WHERE user_id = ? AND vk_group_id = ?", (last_post_id, user_id, vk_group_id))
-    conn.commit()
-    conn.close()
+def toggle_enable(user_id, vk_group_id, enabled):
+    config = load_config()
+    key = str(user_id)
+    if key in config:
+        for entry in config[key]:
+            if entry["vk_group_id"] == vk_group_id:
+                entry["enabled"] = enabled
+                save_config(config)
+                return True
+    return False
 
-def toggle_enable(user_id, index, enabled):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT rowid FROM users WHERE user_id = ? LIMIT 1 OFFSET ?", (user_id, index))
-    row = c.fetchone()
-    if row:
-        c.execute("UPDATE users SET enabled = ? WHERE rowid = ?", (enabled, row[0]))
-        conn.commit()
-    conn.close()
+def update_last_post_id(user_id, vk_group_id, post_id):
+    config = load_config()
+    key = str(user_id)
+    if key in config:
+        for entry in config[key]:
+            if entry["vk_group_id"] == vk_group_id:
+                entry["last_post_id"] = post_id
+                save_config(config)
+                return True
+    return False
+
+def mark_post_sent(user_id, vk_group_id, post_id):
+    config = load_config()
+    key = str(user_id)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if key in config:
+        for entry in config[key]:
+            if entry["vk_group_id"] == vk_group_id:
+                # Удаляем записи старше сегодня
+                entry["daily_posts"] = [p for p in entry["daily_posts"] if p.get("date") == today]
+                # Добавляем текущий
+                entry["daily_posts"].append({"post_id": post_id, "date": today})
+                save_config(config)
+                return True
+    return False
+
+def get_today_post_count(user_id, vk_group_id):
+    config = load_config()
+    key = str(user_id)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if key in config:
+        for entry in config[key]:
+            if entry["vk_group_id"] == vk_group_id:
+                return sum(1 for p in entry["daily_posts"] if p.get("date") == today)
+    return 0
+
+def clear_old_daily_posts():
+    """Удаляет записи старше 7 дней."""
+    config = load_config()
+    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    changed = False
+    for user_id, entries in config.items():
+        for entry in entries:
+            old_len = len(entry["daily_posts"])
+            entry["daily_posts"] = [p for p in entry["daily_posts"] if p.get("date") >= week_ago]
+            if len(entry["daily_posts"]) != old_len:
+                changed = True
+    if changed:
+        save_config(config)
 
 # ===== ФУНКЦИИ ДЛЯ РАБОТЫ С VK =====
 def vk_api_request(method, params, token):
@@ -125,7 +178,6 @@ def get_last_posts(group_id, token, count=5):
 
 # ===== ФУНКЦИИ ДЛЯ ОТПРАВКИ В TELEGRAM =====
 async def send_to_telegram(tg_token, chat_id, text, attachments=None):
-    """Отправляет пост в Telegram-канал через бота-исполнителя."""
     bot = None
     try:
         from telegram import Bot
@@ -156,25 +208,35 @@ async def send_to_telegram(tg_token, chat_id, text, attachments=None):
         if bot:
             await bot.close()
 
-# ===== ФОНОВЫЙ ПОТОК ДЛЯ ПРОВЕРКИ НОВЫХ ПОСТОВ =====
+# ===== ФОНОВЫЙ ПОТОК =====
 async def check_new_posts(context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT user_id, vk_token, vk_group_id, tg_token, tg_chat_id, last_post_id FROM users WHERE enabled = 1")
-    configs = c.fetchall()
-    conn.close()
+    clear_old_daily_posts()
+    config = load_config()
+    for user_id_str, entries in config.items():
+        user_id = int(user_id_str)
+        for entry in entries:
+            if not entry["enabled"]:
+                continue
+            vk_token = entry["vk_token"]
+            vk_group_id = entry["vk_group_id"]
+            tg_token = entry["tg_token"]
+            tg_chat_id = entry["tg_chat_id"]
+            last_post_id = entry["last_post_id"]
 
-    for user_id, vk_token, vk_group_id, tg_token, tg_chat_id, last_post_id in configs:
-        try:
+            today_count = get_today_post_count(user_id, vk_group_id)
+            if today_count >= MAX_POSTS_PER_DAY:
+                continue
+
             posts = get_last_posts(vk_group_id, vk_token, count=5)
             if not posts:
                 continue
-            new_posts = []
-            for post in posts:
-                if post["id"] > last_post_id:
-                    new_posts.append(post)
+
+            new_posts = [p for p in posts if p["id"] > last_post_id]
             new_posts.sort(key=lambda x: x["id"])
+
             for post in new_posts:
+                if today_count >= MAX_POSTS_PER_DAY:
+                    break
                 text = post.get("text", "")
                 if not text:
                     text = "Новый пост без текста"
@@ -184,49 +246,44 @@ async def check_new_posts(context: ContextTypes.DEFAULT_TYPE):
                 success = await send_to_telegram(tg_token, tg_chat_id, full_text, attachments)
                 if success:
                     update_last_post_id(user_id, vk_group_id, post["id"])
+                    mark_post_sent(user_id, vk_group_id, post["id"])
+                    today_count += 1
+                    logger.info(f"✅ Отправлен пост {post['id']} для группы {vk_group_id} (сегодня {today_count})")
                 else:
-                    logger.error(f"Failed to send post {post['id']} for user {user_id}")
-                await asyncio.sleep(1)
-        except Exception as e:
-            logger.error(f"Error processing config for user {user_id}: {e}")
+                    logger.error(f"❌ Не удалось отправить пост {post['id']}")
+                await asyncio.sleep(SEND_DELAY)  # пауза
 
-# ===== ОБРАБОТЧИКИ КОМАНД TELEGRAM =====
+# ===== ОБРАБОТЧИКИ КОМАНД =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     await update.message.reply_text(
         "👋 Привет! Я бот для пересылки постов из ВК в Telegram.\n\n"
         "🔧 Команды:\n"
-        "/add - добавить новую связку (группа ВК → канал)\n"
-        "/list - показать все ваши связки\n"
-        "/delete <номер> - удалить связку по номеру\n"
-        "/toggle <номер> - включить/выключить связку\n"
-        "/help - показать это сообщение"
+        "/add - добавить связку\n"
+        "/list - показать все связки\n"
+        "/delete <ID_группы> - удалить связку\n"
+        "/toggle <ID_группы> - включить/выключить\n"
+        "/help - помощь"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔧 Команды:\n"
-        "/add - добавить новую связку (группа ВК → канал)\n"
-        "/list - показать все ваши связки\n"
-        "/delete <номер> - удалить связку по номеру\n"
-        "/toggle <номер> - включить/выключить связку\n"
-        "/help - показать это сообщение"
+        "/add - добавить связку\n"
+        "/list - список связок\n"
+        "/delete <ID_группы> - удалить\n"
+        "/toggle <ID_группы> - включить/выключить\n"
+        "/help - помощь"
     )
 
 async def add_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     configs = get_user_configs(user_id)
-    if len(configs) >= 3:
-        await update.message.reply_text("❌ Вы уже добавили максимум 3 связки.")
+    if len(configs) >= MAX_CONFIGS_PER_USER:
+        await update.message.reply_text(f"❌ Вы уже добавили максимум {MAX_CONFIGS_PER_USER} связок.")
         return
     await update.message.reply_text(
-        "📝 Для добавления новой связки отправьте мне данные в формате:\n"
+        "📝 Отправьте данные в формате:\n"
         "`VK_TOKEN VK_GROUP_ID TG_TOKEN TG_CHAT_ID`\n\n"
-        "Где:\n"
-        "• VK_TOKEN — сервисный ключ вашей группы ВК\n"
-        "• VK_GROUP_ID — ID группы ВК (с минусом, например -12345678)\n"
-        "• TG_TOKEN — токен Telegram-бота для канала (от @BotFather)\n"
-        "• TG_CHAT_ID — ID канала (например, @channel или -1001234567890)\n\n"
         "Пример:\n"
         "`vk1.a.xxx -12345678 123456:ABCdef @my_channel`",
         parse_mode="Markdown"
@@ -241,36 +298,49 @@ async def handle_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = text.split()
     if len(parts) != 4:
         await update.message.reply_text("❌ Неверный формат. Нужно 4 параметра.")
+        context.user_data["awaiting_add"] = False
         return
     vk_token, vk_group_id_str, tg_token, tg_chat_id = parts
     try:
         vk_group_id = int(vk_group_id_str)
     except ValueError:
         await update.message.reply_text("❌ VK_GROUP_ID должен быть числом (с минусом).")
+        context.user_data["awaiting_add"] = False
         return
     configs = get_user_configs(user_id)
-    if len(configs) >= 3:
-        await update.message.reply_text("❌ Вы уже добавили максимум 3 связки.")
+    if len(configs) >= MAX_CONFIGS_PER_USER:
+        await update.message.reply_text(f"❌ Достигнут лимит {MAX_CONFIGS_PER_USER} связок.")
+        context.user_data["awaiting_add"] = False
         return
     if not vk_token.startswith("vk1.a."):
-        await update.message.reply_text("❌ Похоже, VK_TOKEN неверный. Он должен начинаться с 'vk1.a.'")
+        await update.message.reply_text("❌ VK_TOKEN должен начинаться с 'vk1.a.'")
+        context.user_data["awaiting_add"] = False
         return
-    if not tg_token or not tg_chat_id:
-        await update.message.reply_text("❌ TG_TOKEN или TG_CHAT_ID не могут быть пустыми.")
-        return
-    add_user_config(user_id, vk_token, vk_group_id, tg_token, tg_chat_id)
-    await update.message.reply_text("✅ Связка успешно добавлена! Бот начнёт отслеживать посты.")
+    # Проверяем дубли
+    for entry in configs:
+        if entry["vk_group_id"] == vk_group_id:
+            await update.message.reply_text(f"❌ Связка для группы {vk_group_id} уже существует.")
+            context.user_data["awaiting_add"] = False
+            return
+    success = add_user_config(user_id, vk_token, vk_group_id, tg_token, tg_chat_id)
+    if success:
+        await update.message.reply_text("✅ Связка успешно добавлена!")
+    else:
+        await update.message.reply_text("❌ Не удалось добавить связку (возможно, дубликат).")
     context.user_data["awaiting_add"] = False
 
 async def list_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     configs = get_user_configs(user_id)
     if not configs:
-        await update.message.reply_text("📭 У вас нет добавленных связок.")
+        await update.message.reply_text("📭 Нет связок.")
         return
     lines = []
-    for idx, (vk_token, vk_group_id, tg_token, tg_chat_id, last_post_id, enabled) in enumerate(configs):
-        status = "✅" if enabled else "❌"
+    for idx, entry in enumerate(configs):
+        status = "✅" if entry["enabled"] else "❌"
+        vk_group_id = entry["vk_group_id"]
+        tg_chat_id = entry["tg_chat_id"]
+        last_post_id = entry["last_post_id"]
         lines.append(f"{idx+1}. {status} Группа {vk_group_id} → Канал {tg_chat_id} (last_post: {last_post_id})")
     await update.message.reply_text("📋 Ваши связки:\n" + "\n".join(lines))
 
@@ -278,46 +348,47 @@ async def delete_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     if not args:
-        await update.message.reply_text("❌ Укажите номер связки для удаления. Пример: /delete 1")
+        await update.message.reply_text("❌ Укажите ID группы. Пример: /delete -197687739")
         return
     try:
-        idx = int(args[0]) - 1
+        vk_group_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ Номер должен быть числом.")
+        await update.message.reply_text("❌ ID группы должен быть числом.")
         return
-    configs = get_user_configs(user_id)
-    if idx < 0 or idx >= len(configs):
-        await update.message.reply_text("❌ Связки с таким номером нет.")
-        return
-    delete_user_config(user_id, idx)
-    await update.message.reply_text("✅ Связка удалена.")
+    success = delete_user_config(user_id, vk_group_id)
+    if success:
+        await update.message.reply_text(f"✅ Связка для группы {vk_group_id} удалена.")
+    else:
+        await update.message.reply_text(f"❌ Связка для группы {vk_group_id} не найдена.")
 
 async def toggle_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
     if not args:
-        await update.message.reply_text("❌ Укажите номер связки для включения/выключения. Пример: /toggle 1")
+        await update.message.reply_text("❌ Укажите ID группы. Пример: /toggle -197687739")
         return
     try:
-        idx = int(args[0]) - 1
+        vk_group_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ Номер должен быть числом.")
+        await update.message.reply_text("❌ ID группы должен быть числом.")
         return
     configs = get_user_configs(user_id)
-    if idx < 0 or idx >= len(configs):
-        await update.message.reply_text("❌ Связки с таким номером нет.")
+    target = None
+    for entry in configs:
+        if entry["vk_group_id"] == vk_group_id:
+            target = entry
+            break
+    if not target:
+        await update.message.reply_text(f"❌ Связка для группы {vk_group_id} не найдена.")
         return
-    current_enabled = configs[idx][5]
-    new_enabled = 0 if current_enabled else 1
-    toggle_enable(user_id, idx, new_enabled)
+    new_enabled = not target["enabled"]
+    toggle_enable(user_id, vk_group_id, new_enabled)
     status = "включена" if new_enabled else "выключена"
-    await update.message.reply_text(f"✅ Связка {idx+1} {status}.")
+    await update.message.reply_text(f"✅ Связка для группы {vk_group_id} {status}.")
 
-# ===== ЗАПУСК БОТА =====
+# ===== ЗАПУСК =====
 def main():
-    # Создаем приложение с токеном MAIN_TOKEN
     application = Application.builder().token(MAIN_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("add", add_config))
